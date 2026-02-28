@@ -23,13 +23,18 @@ THREADS_TABLE = f"{PROJECT_ID}.{DATASET_ID}.threads_and_posts"
 def get_bq_client():
     """Initialize the BigQuery client using Streamlit Secrets or local environment variables."""
     try:
-        # 1. Cloud Deployment: Check for Streamlit Secrets
+        # 1. Cloud Deployment: Check for pure JSON Streamlit Secret (Bulletproof bypassing TOML parsing bugs)
         if "gcp_service_account" in st.secrets:
-            # We must explicitly convert the Streamlit AttrDict into a standard dict
-            # AND explicitly replace literal string "\n" with hard newline carriage returns 
-            # so the Cryptography library correctly stacks the PEM certificate formatting.
-            secret_dict = dict(st.secrets["gcp_service_account"])
-            secret_dict["private_key"] = secret_dict["private_key"].replace('\\n', '\n')
+            import json
+            
+            # If the user pasted the JSON string variable
+            if isinstance(st.secrets["gcp_service_account"], str):
+                secret_dict = json.loads(st.secrets["gcp_service_account"])
+            # If the user pasted the TOML dictionary 
+            else:
+                secret_dict = dict(st.secrets["gcp_service_account"])
+                if "\\n" in secret_dict.get("private_key", ""):
+                    secret_dict["private_key"] = secret_dict["private_key"].replace('\\n', '\n')
             
             credentials = service_account.Credentials.from_service_account_info(secret_dict)
             return bigquery.Client(credentials=credentials, project=credentials.project_id)
