@@ -25,7 +25,13 @@ def get_bq_client():
     try:
         # 1. Cloud Deployment: Check for Streamlit Secrets
         if "gcp_service_account" in st.secrets:
-            credentials = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+            # We must explicitly convert the Streamlit AttrDict into a standard dict
+            # AND explicitly replace literal string "\n" with hard newline carriage returns 
+            # so the Cryptography library correctly stacks the PEM certificate formatting.
+            secret_dict = dict(st.secrets["gcp_service_account"])
+            secret_dict["private_key"] = secret_dict["private_key"].replace('\\n', '\n')
+            
+            credentials = service_account.Credentials.from_service_account_info(secret_dict)
             return bigquery.Client(credentials=credentials, project=credentials.project_id)
         
         # 2. Local Deployment: Check for Environment Credentials
