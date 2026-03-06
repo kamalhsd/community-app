@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import pandas as pd
 from google.cloud import bigquery
+from google.oauth2 import service_account
 import requests
 from datetime import datetime
 
@@ -9,15 +10,7 @@ from datetime import datetime
 # 1. BigQuery Authentication & Initialization
 # ==========================================
 
-CREDENTIALS_PATH = "google_credentials.json"
-
-# Check local credentials map as per strict coding directive #1
-if os.path.exists(CREDENTIALS_PATH):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = CREDENTIALS_PATH
-else:
-    st.error(f"⚠️ Credentials file '{CREDENTIALS_PATH}' not found in the root directory. Database queries will fail.")
-
-st.set_page_config(page_title="Forum CRM Hub", layout="wide", page_icon="📡")
+st.set_page_config(page_title="Forum CRM Hub (Cloud)", layout="wide", page_icon="☁️")
 
 # IMPORTANT: Admin should update these variables to their GCP project and dataset.
 PROJECT_ID = "my-new-project-480609"
@@ -27,19 +20,32 @@ USERS_TABLE = f"{PROJECT_ID}.{DATASET_ID}.users_master"
 CATEGORIES_TABLE = f"{PROJECT_ID}.{DATASET_ID}.categories_master"
 THREADS_TABLE = f"{PROJECT_ID}.{DATASET_ID}.threads_and_posts"
 
-# ==========================================
-# Google Apps Script Proxy (Firewall Bypass)
-# ==========================================
-# If your Nginx/Cloudflare blocks Python requests, deploy the provided Google_Apps_Script_Proxy.js
-# and paste its Web App URL here. Leave empty "" to connect directly to XenForo.
-GAS_PROXY_URL = "https://script.google.com/macros/s/AKfycbwIetBB304AzQePfZTcjD5QkJNjWHzlAz0-sWoDVIwIyQuqPfUm5uyuMkBy6_RVzpLu/exec"
-
 def get_bq_client():
-    """Initialize the BigQuery client. Will use the os.environ credentials automatically."""
+    """Initialize the BigQuery client using Streamlit Secrets or local environment variables."""
     try:
-        if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
+        # 1. Cloud Deployment: Check for pure JSON Streamlit Secret (Bulletproof bypassing TOML parsing bugs)
+        if "gcp_service_account" in st.secrets:
+            import json
+            
+            # If the user pasted the JSON string variable
+            if isinstance(st.secrets["gcp_service_account"], str):
+                secret_dict = json.loads(st.secrets["gcp_service_account"])
+            # If the user pasted the TOML dictionary 
+            else:
+                secret_dict = dict(st.secrets["gcp_service_account"])
+                if "\\n" in secret_dict.get("private_key", ""):
+                    secret_dict["private_key"] = secret_dict["private_key"].replace('\\n', '\n')
+            
+            credentials = service_account.Credentials.from_service_account_info(secret_dict)
+            return bigquery.Client(credentials=credentials, project=credentials.project_id)
+        
+        # 2. Local Deployment: Check for Environment Credentials
+        elif "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
             return bigquery.Client()
-        return None
+            
+        else:
+            st.error("⚠️ BigQuery credentials not found. Please configure Streamlit Secrets or set GOOGLE_APPLICATION_CREDENTIALS.")
+            return None
     except Exception as e:
         st.error(f"Failed to initialize BigQuery Client: {e}")
         return None
@@ -72,7 +78,7 @@ def fetch_metadata():
         sites_query = f"SELECT DISTINCT site_id FROM `{USERS_TABLE}` WHERE site_id IS NOT NULL"
         sites = bq_client.query(sites_query).to_dataframe()['site_id'].tolist()
         
-        cats_query = f"SELECT site_id, category_name, node_id FROM `{CATEGORIES_TABLE}`"
+        cats_query = f"SELECT site_id, category_name FROM `{CATEGORIES_TABLE}`"
         cats_df = bq_client.query(cats_query).to_dataframe()
         
         users_query = f"SELECT site_id, username, api_user_id FROM `{USERS_TABLE}`"
@@ -84,7 +90,7 @@ def fetch_metadata():
         return [], pd.DataFrame(), pd.DataFrame()
 
 
-def fetch_filtered_threads(site_id, ans_min, ans_max, selected_user, keyword, selected_categories=None):
+def fetch_filtered_threads(site_id, ans_min, ans_max, selected_user, keyword):
     """
     BigQuery SELECT query to feed Zone 2 dataframe based on Zone 1 filters.
     Includes explicit schema parsing from threads_and_posts.
@@ -97,9 +103,6 @@ def fetch_filtered_threads(site_id, ans_min, ans_max, selected_user, keyword, se
         
         if keyword:
             where_clauses.append("(LOWER(content) LIKE LOWER(@keyword) OR LOWER(target_link) LIKE LOWER(@keyword))")
-            
-        if selected_categories and len(selected_categories) > 0:
-            where_clauses.append("category_name IN UNNEST(@selected_categories)")
             
         where_str = " AND ".join(where_clauses)
 
@@ -132,18 +135,15 @@ def fetch_filtered_threads(site_id, ans_min, ans_max, selected_user, keyword, se
             
         query += " ORDER BY last_active_date DESC"
 
-        query_params = [
-            bigquery.ScalarQueryParameter("site_id", "STRING", site_id),
-            bigquery.ScalarQueryParameter("selected_user", "STRING", selected_user if selected_user != "All" else ""),
-            bigquery.ScalarQueryParameter("keyword", "STRING", f"%{keyword}%" if keyword else ""),
-            bigquery.ScalarQueryParameter("ans_min", "INT64", ans_min),
-            bigquery.ScalarQueryParameter("ans_max", "INT64", ans_max)
-        ]
-        
-        if selected_categories and len(selected_categories) > 0:
-            query_params.append(bigquery.ArrayQueryParameter("selected_categories", "STRING", selected_categories))
-
-        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("site_id", "STRING", site_id),
+                bigquery.ScalarQueryParameter("selected_user", "STRING", selected_user if selected_user != "All" else ""),
+                bigquery.ScalarQueryParameter("keyword", "STRING", f"%{keyword}%" if keyword else ""),
+                bigquery.ScalarQueryParameter("ans_min", "INT64", ans_min),
+                bigquery.ScalarQueryParameter("ans_max", "INT64", ans_max)
+            ]
+        )
         
         return bq_client.query(query, job_config=job_config).to_dataframe()
         
@@ -157,7 +157,7 @@ def fetch_bulk_thread_history(thread_ids, site_id):
     if not bq_client or not thread_ids: return pd.DataFrame()
     try:
         query = f"""
-            SELECT site_id, thread_id, post_id, username, content, post_type, timestamp, target_link, question_url, answer_url
+            SELECT thread_id, post_id, username, content, post_type, timestamp, target_link, question_url, answer_url
             FROM `{THREADS_TABLE}`
             WHERE site_id = @site_id AND thread_id IN UNNEST(@thread_ids)
             ORDER BY timestamp ASC
@@ -173,189 +173,17 @@ def fetch_bulk_thread_history(thread_ids, site_id):
         st.error(f"Error executing fetch_bulk_thread_history: {e}")
         return pd.DataFrame()
 
-def fetch_user_stats(site_id):
-    """Aggregate threads and answers per user for a specific site."""
-    if not bq_client: return pd.DataFrame()
-    query = f"""
-        SELECT 
-            username as Username,
-            COUNTIF(post_type = 'Question') AS Threads_Created,
-            COUNTIF(post_type = 'Answer') AS Answers_Posted
-        FROM `{THREADS_TABLE}`
-        WHERE site_id = @site_id
-        GROUP BY username
-        ORDER BY Answers_Posted DESC, Threads_Created DESC
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("site_id", "STRING", site_id)
-        ]
-    )
-    try:
-        return bq_client.query(query, job_config=job_config).to_dataframe()
-    except Exception as e:
-        st.error(f"Error fetching user stats: {e}")
-        return pd.DataFrame()
-
-def fetch_daily_questions(site_id, target_date):
-    """Fetch all Question threads published on a specific date."""
-    if not bq_client: return pd.DataFrame()
-    query = f"""
-        SELECT 
-            FORMAT_DATETIME('%Y-%m-%d', timestamp) AS Date,
-            username AS User,
-            IFNULL(category_name, 'Not Mapped') AS Forum_Category,
-            content AS Question,
-            question_url AS Question_URL
-        FROM `{THREADS_TABLE}`
-        WHERE site_id = @site_id 
-          AND DATE(timestamp) = @target_date 
-          AND post_type = 'Question'
-        ORDER BY timestamp DESC
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("site_id", "STRING", site_id),
-            bigquery.ScalarQueryParameter("target_date", "DATE", target_date)
-        ]
-    )
-    try:
-        return bq_client.query(query, job_config=job_config).to_dataframe()
-    except Exception as e:
-        st.error(f"Error fetching daily questions: {e}")
-        return pd.DataFrame()
-
-def fetch_daily_answers(site_id, target_date):
-    """Fetch all Answer replies published on a specific date."""
-    if not bq_client: return pd.DataFrame()
-    query = f"""
-        SELECT 
-            FORMAT_DATETIME('%Y-%m-%d', timestamp) AS Date,
-            username AS Username,
-            content AS Answer,
-            question_url AS Question_URL,
-            answer_url AS Answer_Links
-        FROM `{THREADS_TABLE}`
-        WHERE site_id = @site_id 
-          AND DATE(timestamp) = @target_date 
-          AND post_type = 'Answer'
-        ORDER BY timestamp DESC
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("site_id", "STRING", site_id),
-            bigquery.ScalarQueryParameter("target_date", "DATE", target_date)
-        ]
-    )
-    try:
-        return bq_client.query(query, job_config=job_config).to_dataframe()
-    except Exception as e:
-        st.error(f"Error fetching daily answers: {e}")
-        return pd.DataFrame()
-
-def generate_ai_reply(provider, api_key_or_url, model, context_df, username):
-    """
-    Takes the chronological thread_history_df and formats it into a robust prompt 
-    for Gemini, Groq, or Ollama to generate a contextual response.
-    """
-    if context_df.empty:
-        return "Not enough context to generate a reply."
-        
-    # Build conversation context string
-    context_str = "Thread History:\n\n"
-    for _, row in context_df.iterrows():
-        context_str += f"[{row['timestamp']}] {row['username']} ({row['post_type']}):\n{row['content']}\n\n"
-        
-    system_prompt = f"""You are a helpful, knowledgeable participant on a specialized internet forum.
-Your username is {username}. 
-Review the thread history provided, and write a natural, conversational reply that directly addresses the ongoing discussion.
-Do not wrap your response in quotes. Do not include signature blocks. Just write the message body."""
-
-    try:
-        if provider == "Gemini":
-            if not api_key_or_url: return "Error: Gemini API Key required."
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key_or_url}"
-            payload = {
-                "contents": [{"parts": [{"text": f"{system_prompt}\n\n{context_str}"}]}],
-                "generationConfig": {
-                    "temperature": 0.7
-                }
-            }
-            res = requests.post(url, json=payload, timeout=30)
-            if res.status_code == 200:
-                data = res.json()
-                return data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', 'Error: No text returned.')
-            else:
-                return f"Gemini API Error: {res.text}"
-                
-        elif provider == "Groq":
-            if not api_key_or_url: return "Error: Groq API Key required."
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key_or_url}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": context_str}
-                ],
-                "temperature": 0.7
-            }
-            res = requests.post(url, headers=headers, json=payload, timeout=30)
-            if res.status_code == 200:
-                data = res.json()
-                return data.get('choices', [{}])[0].get('message', {}).get('content', 'Error: No text returned.')
-            else:
-                return f"Groq API Error: {res.text}"
-                
-        elif provider == "Ollama":
-            if not api_key_or_url: return "Error: Ollama Base URL required (e.g., http://localhost:11434)."
-            url = f"{api_key_or_url.rstrip('/')}/api/chat"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": context_str}
-                ],
-                "stream": False
-            }
-            res = requests.post(url, json=payload, timeout=60)
-            if res.status_code == 200:
-                data = res.json()
-                return data.get('message', {}).get('content', 'Error: No text returned.')
-            else:
-                return f"Ollama API Error: {res.text}"
-                
-    except Exception as e:
-        return f"Request Error: {str(e)}"
-
-# ==========================================
-# XenForo Sites Configuration
-# ==========================================
-WEBSITES = {
-    "techzeel": { "url": "https://community.techzeel.net", "key": "N1WiyPo_LLSBxwH5DjIFIG_VtLXFJ6WR" },
-    "triphippies": { "url": "https://community.triphippies.com", "key": "usw7qzpu-DJSLNJRjZwtFX_UJCfptbbN" },
-    "healthgroovy": { "url": "https://community.healthgroovy.com", "key": "sjdhr-_b8KcC74-rARoJ9Vf-uCO8F5Yz" },
-    "learningtoday": { "url": "https://community.learningtoday.net", "key": "FSyv1CkfBqDpGd-mkI8wgCIVSYuzsubF" },
-    "allinsider": { "url": "https://forum.allinsider.net", "key": "ZJoQ2YJ2HeFD4Nn2tvqJ8lLgndbHkmps" },
-    "radarro": { "url": "https://community.radarro.com", "key": "xAAsWa0-Y-BEoNJASELYHYFypKtxKC9m" },
-    "getassist": { "url": "https://forum.getassist.net", "key": "JfGAv9RuSVUpO7_LehiAVGRgdg19YqB1" },
-    "yourhomify": { "url": "https://community.yourhomify.com", "key": "e9QvVWyGa37-0GGusiiTiuvYH3onHrW-" },
-    "accountingbyte": { "url": "https://forum.accountingbyte.com", "key": "oOrx1YU-mEtvw_GEKMBdJowERzaL938H" },
-    "sportsbyte": { "url": "https://community.sportsbyte.net", "key": "8OtIhtd-R1BPHi13jyXT2WsHcsayoXGZ" }
-}
 
 def post_to_xenforo(site_id, thread_id, api_user_id, message):
     """The REST API call using requests to XenForo."""
-    site_config = WEBSITES.get(site_id.lower())
-    if not site_config:
-        st.error(f"Unknown site ID: {site_id}")
-        return None
-        
-    api_key = site_config["key"]
-    site_url = f"{site_config['url']}/api/posts"
+    # Hardcoded API key as requested
+    api_key = "8OtIhtd-R1BPHi13jyXT2WsHcsayoXGZ"
+    
+    # Custom site mapping based on site_id
+    if site_id == "sportsbyte":
+        site_url = f"https://sportsbyte.com/api/threads/{thread_id}/posts"
+    else:
+        site_url = f"https://{site_id}.com/api/threads/{thread_id}/posts" 
     
     headers = {
         "XF-Api-Key": api_key,
@@ -364,83 +192,35 @@ def post_to_xenforo(site_id, thread_id, api_user_id, message):
     }
     
     payload = {
-        "thread_id": int(thread_id),
         "message": message
     }
     
-    # -----------------------------------
-    # Route via Google Apps Script Proxy
-    # -----------------------------------
-    if GAS_PROXY_URL:
-        proxy_payload = {
-            "target_url": site_url,
-            "headers": headers,
-            "payload": payload
-        }
-        try:
-            response = requests.post(GAS_PROXY_URL, json=proxy_payload, timeout=15)
-            if response.status_code == 200:
-                res_json = response.json()
-                if "error" in res_json:
-                    st.error(f"GAS Proxy Error: {res_json['error']}")
-                    return None
-                    
-                import json
-                raw_xf_data = res_json.get("data", "{}")
-                
-                try:
-                    xf_res = json.loads(raw_xf_data)
-                    if res_json.get("status") == 200:
-                        post_data = xf_res.get('post', {})
-                        if 'post_id' in post_data:
-                            return int(post_data['post_id']), post_data.get('view_url')
-                        else:
-                            st.warning(f"Reply created, but couldn't parse ID. Raw: {xf_res}")
-                            return None, None
-                    else:
-                        st.error(f"XenForo API Error via Proxy (Code {res_json.get('status')}): {xf_res}")
-                        return None, None
-                except json.JSONDecodeError:
-                    # XenForo returned HTML instead of JSON (usually a 404/403 block)
-                    st.error(f"XenForo Proxy Error (HTML Returned, Code {res_json.get('status')}): {raw_xf_data[:500]}...")
-                    return None, None
-            else:
-                st.error(f"GAS Proxy Request Failed: {response.text}")
-                return None
-        except Exception as e:
-            st.error(f"GAS Proxy Network Error: {e}")
-            return None
-
-    # -----------------------------------
-    # Direct Route
-    # -----------------------------------
     try:
         response = requests.post(site_url, headers=headers, data=payload, timeout=10)
         
         if response.status_code == 200:
-            post_data = response.json().get('post', {})
-            return int(post_data.get('post_id')), post_data.get('view_url')
+            return response.json().get('post', {}).get('post_id')
         else:
             st.error(f"XenForo API Error [{response.status_code}]: {response.text}")
-            return None, None
+            return None
     except requests.exceptions.ConnectionError:
+        # Fallback to HTTP if HTTPS is actively refused (e.g. local dev servers or expired SSLs)
         try:
             fallback_url = site_url.replace("https://", "http://")
             response = requests.post(fallback_url, headers=headers, data=payload, timeout=10)
             if response.status_code == 200:
-                post_data = response.json().get('post', {})
-                return int(post_data.get('post_id')), post_data.get('view_url')
+                return response.json().get('post', {}).get('post_id')
             else:
                 st.error(f"XenForo API Error (HTTP Fallback) [{response.status_code}]: {response.text}")
-                return None, None
+                return None
         except Exception as fallback_e:
-            st.error(f"XenForo Network Error (HTTPS/HTTP Failed): {fallback_e}")
-            return None, None
+            st.error(f"XenForo Network/Request Error (Both HTTPS & HTTP Failed): {fallback_e}")
+            return None
     except Exception as e:
         st.error(f"XenForo Network/Request Error: {e}")
-        return None, None
+        return None
 
-def log_to_bigquery(site_id, thread_id, post_id, username, content, target_link, answer_url=None):
+def log_to_bigquery(site_id, thread_id, post_id, username, content, target_link):
     """BigQuery INSERT statement logging the successful API post."""
     if not bq_client: return False
     try:
@@ -449,7 +229,7 @@ def log_to_bigquery(site_id, thread_id, post_id, username, content, target_link,
         query = f"""
             INSERT INTO `{THREADS_TABLE}` 
             (site_id, thread_id, post_id, username, content, post_type, timestamp, target_link, category_name, question_url, answer_url)
-            VALUES (@site_id, @thread_id, @post_id, @username, @content, 'Answer', CURRENT_DATETIME(), @target_link, NULL, NULL, @answer_url)
+            VALUES (@site_id, @thread_id, @post_id, @username, @content, 'Answer', CURRENT_DATETIME(), @target_link, NULL, NULL, NULL)
         """
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
@@ -458,8 +238,7 @@ def log_to_bigquery(site_id, thread_id, post_id, username, content, target_link,
                 bigquery.ScalarQueryParameter("post_id", "INT64", post_id),
                 bigquery.ScalarQueryParameter("username", "STRING", username),
                 bigquery.ScalarQueryParameter("content", "STRING", content),
-                bigquery.ScalarQueryParameter("target_link", "STRING", target_link if target_link else None),
-                bigquery.ScalarQueryParameter("answer_url", "STRING", answer_url if answer_url else None)
+                bigquery.ScalarQueryParameter("target_link", "STRING", target_link if target_link else None)
             ]
         )
         # Block until the query completes
@@ -471,13 +250,12 @@ def log_to_bigquery(site_id, thread_id, post_id, username, content, target_link,
 
 def create_xenforo_thread(site_id, node_id, api_user_id, title, message):
     """The REST API call to XenForo to create a new thread."""
-    site_config = WEBSITES.get(site_id.lower())
-    if not site_config:
-        st.error(f"Unknown site ID: {site_id}")
-        return None
-        
-    api_key = site_config["key"]
-    site_url = f"{site_config['url']}/api/threads"
+    api_key = "8OtIhtd-R1BPHi13jyXT2WsHcsayoXGZ"
+    
+    if site_id == "sportsbyte":
+        site_url = "https://sportsbyte.com/api/threads"
+    else:
+        site_url = f"https://{site_id}.com/api/threads"
         
     headers = {
         "XF-Api-Key": api_key,
@@ -486,83 +264,35 @@ def create_xenforo_thread(site_id, node_id, api_user_id, title, message):
     }
     
     payload = {
-        "node_id": int(node_id),
+        "node_id": node_id,
         "title": title,
-        "message": message,
-        "discussion_type": "discussion"
+        "message": message
     }
     
-    # -----------------------------------
-    # Route via Google Apps Script Proxy
-    # -----------------------------------
-    if GAS_PROXY_URL:
-        proxy_payload = {
-            "target_url": site_url,
-            "headers": headers,
-            "payload": payload
-        }
-        try:
-            response = requests.post(GAS_PROXY_URL, json=proxy_payload, timeout=15)
-            if response.status_code == 200:
-                res_json = response.json()
-                if "error" in res_json:
-                    st.error(f"GAS Proxy Error: {res_json['error']}")
-                    return None
-                    
-                import json
-                raw_xf_data = res_json.get("data", "{}")
-                
-                try:
-                    xf_res = json.loads(raw_xf_data)
-                    if res_json.get("status") == 200:
-                        thread_data = xf_res.get('thread', {})
-                        if 'thread_id' in thread_data:
-                            return int(thread_data['thread_id']), thread_data.get('view_url')
-                        else:
-                            st.warning(f"Thread created, but couldn't parse ID. Raw: {xf_res}")
-                            return None, None
-                    else:
-                        st.error(f"XenForo API Error via Proxy (Code {res_json.get('status')}): {xf_res}")
-                        return None, None
-                except json.JSONDecodeError:
-                    # XenForo returned HTML instead of JSON (usually a 404/403 block)
-                    st.error(f"XenForo Proxy Error (HTML Returned, Code {res_json.get('status')}): {raw_xf_data[:500]}...")
-                    return None, None
-            else:
-                st.error(f"GAS Proxy Request Failed: {response.text}")
-                return None
-        except Exception as e:
-            st.error(f"GAS Proxy Network Error: {e}")
-            return None
-
-    # -----------------------------------
-    # Direct Route
-    # -----------------------------------
     try:
         response = requests.post(site_url, headers=headers, data=payload, timeout=10)
         
         if response.status_code == 200:
-            thread_data = response.json().get('thread', {})
-            return int(thread_data.get('thread_id')), thread_data.get('view_url')
+            return response.json().get('thread', {}).get('thread_id')
         else:
             st.error(f"XenForo API Error [{response.status_code}]: {response.text}")
-            return None, None
+            return None
     except requests.exceptions.ConnectionError:
+        # Fallback to HTTP if HTTPS is actively refused (e.g. local dev servers or expired SSLs)
         try:
             fallback_url = site_url.replace("https://", "http://")
             response = requests.post(fallback_url, headers=headers, data=payload, timeout=10)
             if response.status_code == 200:
-                thread_data = response.json().get('thread', {})
-                return int(thread_data.get('thread_id')), thread_data.get('view_url')
+                return response.json().get('thread', {}).get('thread_id')
             else:
                 st.error(f"XenForo API Error (HTTP Fallback) [{response.status_code}]: {response.text}")
-                return None, None
+                return None
         except Exception as fallback_e:
-            st.error(f"XenForo Network Error (HTTPS/HTTP Failed): {fallback_e}")
-            return None, None
+            st.error(f"XenForo Network/Request Error (Both HTTPS & HTTP Failed): {fallback_e}")
+            return None
     except Exception as e:
         st.error(f"XenForo Network/Request Error: {e}")
-        return None, None
+        return None
 
 def log_new_thread_to_bigquery(site_id, thread_id, username, title, category_name, target_link, question_url):
     """BigQuery INSERT statement logging a NEW thread directly natively."""
@@ -588,30 +318,6 @@ def log_new_thread_to_bigquery(site_id, thread_id, username, title, category_nam
         return True
     except Exception as e:
         st.error(f"BigQuery Insert Error: {e}")
-        return False
-
-def delete_post_from_bigquery(site_id, thread_id, post_id):
-    """Deletes an Answer post from BigQuery (useful for scrubbing accidental duplicates)."""
-    if not bq_client: return False
-    try:
-        query = f"""
-            DELETE FROM `{THREADS_TABLE}` 
-            WHERE site_id = @site_id 
-              AND thread_id = @thread_id 
-              AND post_id = @post_id 
-              AND post_type = 'Answer'
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("site_id", "STRING", site_id),
-                bigquery.ScalarQueryParameter("thread_id", "INT64", thread_id),
-                bigquery.ScalarQueryParameter("post_id", "INT64", post_id)
-            ]
-        )
-        bq_client.query(query, job_config=job_config).result()
-        return True
-    except Exception as e:
-        st.error(f"BigQuery Delete Error: {e}")
         return False
 
 
@@ -659,7 +365,7 @@ if selected_site != st.session_state.active_site_id:
 # ------------------------------------------
 # ZONE 2: Top Main Screen (Live Dashboard)
 # ------------------------------------------
-tab_main, tab_import, tab_new_thread, tab_drip_scheduler, tab_user_stats, tab_daily_reports = st.tabs(["Live Dashboard", "Bulk Data Import", "Create New Thread", "Bulk Drip Scheduler", "User Stats", "Daily Reports"])
+tab_main, tab_import, tab_new_thread = st.tabs(["Live Dashboard", "Bulk Data Import", "Create New Thread"])
 
 with tab_import:
     st.header("📁 Bulk Data Import")
@@ -739,8 +445,7 @@ with tab_main:
                     ans_min=ans_min,
                     ans_max=ans_max,
                     selected_user=selected_user_filter,
-                    keyword=keyword_filter,
-                    selected_categories=selected_categories
+                    keyword=keyword_filter
                 )
                 
                 if not df_temp.empty:
@@ -820,15 +525,6 @@ with tab_main:
                     elif not is_question and pd.notnull(row.get('answer_url')) and row['answer_url'] != "":
                         st.caption(f"🌐 Post URL: {row['answer_url']}")
                         
-                    # Delete Button for Duplicate Scrubbing
-                    if not is_question:
-                        if st.button(f"🗑️ Delete from BigQuery", key=f"del_{row['site_id']}_{row['thread_id']}_{row['post_id']}_{_}"):
-                            with st.spinner("Deleting record from database..."):
-                                success = delete_post_from_bigquery(row['site_id'], row['thread_id'], row['post_id'])
-                                if success:
-                                    st.success("Deleted from BigQuery!")
-                                    st.rerun()
-                        
                 # Record usernames for collision check
                 participating_users.add(row['username'])
                 
@@ -845,21 +541,7 @@ with tab_main:
         if reply_username in participating_users:
             st.warning("⚠️ This user has already posted in this thread.")
             
-        with st.expander("🤖 AI Auto-Draft Settings", expanded=False):
-            ai_provider = st.selectbox("AI Provider", ["Gemini", "Groq", "Ollama"])
-            
-            if ai_provider == "Ollama":
-                ai_key_or_url = st.text_input("Ollama Base URL", value="http://localhost:11434")
-                ai_model = st.text_input("Model Name", value="llama3.1")
-            else:
-                ai_key_or_url = st.text_input("API Key", type="password")
-                ai_model = st.text_input("Model Name", value="gemini-2.5-flash" if ai_provider == "Gemini" else "llama3-70b-8192")
-
-        # Session State for AI Draft Injection
-        if 'draft_reply' not in st.session_state:
-            st.session_state.draft_reply = ""
-
-        reply_content = st.text_area("Message Body", value=st.session_state.draft_reply)
+        reply_content = st.text_area("Message Body")
         target_link = st.text_input("Target SEO Link (Optional)")
         
         # Phase 2 Action button layout
@@ -877,19 +559,9 @@ with tab_main:
                     
                     with st.spinner("Publishing via XenForo API & Logging to BigQuery..."):
                         # Execute API
-                        new_post_id, api_answer_url = post_to_xenforo(selected_site, st.session_state.active_thread_id, api_user_id, reply_content)
+                        new_post_id = post_to_xenforo(selected_site, st.session_state.active_thread_id, api_user_id, reply_content)
                         
                         if new_post_id:
-                            # Find parent question URL to construct canonical XenForo answer URL
-                            final_answer_url = api_answer_url
-                            if not thread_history_df.empty:
-                                q_rows = thread_history_df[thread_history_df['post_type'] == 'Question']
-                                if not q_rows.empty and pd.notnull(q_rows.iloc[0].get('question_url')):
-                                    q_url = str(q_rows.iloc[0]['question_url']).strip()
-                                    if q_url:
-                                        # Assemble https://domain.com/threads/title.id/#post-id
-                                        final_answer_url = f"{q_url.rstrip('/')}/#post-{new_post_id}"
-
                             # Log to BQ
                             bq_logged = log_to_bigquery(
                                 selected_site, 
@@ -897,29 +569,14 @@ with tab_main:
                                 new_post_id, 
                                 reply_username, 
                                 reply_content, 
-                                target_link,
-                                final_answer_url
+                                target_link
                             )
                             if bq_logged:
                                 st.success("Successfully published to XenForo and logged state into BigQuery!")
                                 st.rerun() # Refresh Feed and Zone 2 count
         
         with col_ai:
-            if st.button("Auto-Draft with AI", type="secondary"):
-                if not reply_username:
-                    st.error("Please select a user to reply as first.")
-                else:
-                    with st.spinner(f"Drafting contextual reply using {ai_provider}..."):
-                        generated_text = generate_ai_reply(
-                            ai_provider, 
-                            ai_key_or_url, 
-                            ai_model, 
-                            thread_history_df, 
-                            reply_username
-                        )
-                        # Inject into Streamlit session state and force reload
-                        st.session_state.draft_reply = generated_text
-                        st.rerun()
+            st.button("Auto-Draft with Llama 3.1 (Phase 2)", disabled=True)
 
 with tab_new_thread:
     st.header("📝 Create New Thread")
@@ -964,12 +621,9 @@ with tab_new_thread:
                 node_id = cat_row['node_id']
                 
                 with st.spinner(f"Publishing New Thread to {new_site}..."):
-                    new_thread_id, auto_question_url = create_xenforo_thread(new_site, node_id, api_user_id, new_title, new_content)
+                    new_thread_id = create_xenforo_thread(new_site, node_id, api_user_id, new_title, new_content)
                     
                     if new_thread_id:
-                        # Prioritize user-provided question_url if typed, otherwise fall back to auto-extracted URL
-                        final_question_url = new_question_url if new_question_url.strip() != "" else auto_question_url
-                        
                         bq_logged = log_new_thread_to_bigquery(
                             new_site, 
                             new_thread_id, 
@@ -977,138 +631,9 @@ with tab_new_thread:
                             new_title, 
                             new_category, 
                             new_target_link, 
-                            final_question_url
+                            new_question_url
                         )
                         if bq_logged:
                             st.success(f"Successfully created thread #{new_thread_id} and logged directly to Live Dashboard!")
                             # Reset fields without blowing away entire session
                             st.rerun()
-
-with tab_drip_scheduler:
-    st.header("⏳ Bulk Drip Scheduler")
-    st.write("Schedule bulk questions or answers to be dripped over time via Google Cloud Functions.")
-    
-    # 1. Data Entry
-    schema = {
-        "site_id": [""],
-        "thread_id": [0],
-        "username": [""],
-        "content": [""],
-        "post_type": ["Answer"],
-        "target_link": [""]
-    }
-    df_in = pd.DataFrame(schema)
-    
-    edited_df = st.data_editor(df_in, num_rows="dynamic", use_container_width=True)
-    
-    st.markdown("---")
-    # 2. Scheduling Controls
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        start_date = st.date_input("Start Date")
-    with col2:
-        start_time = st.time_input("Start Time")
-    with col3:
-        interval_str = st.selectbox("Interval Between Posts", ["15 Minutes", "30 Minutes", "1 Hour", "2 Hours"])
-        
-    # 3. Execution Logic
-    if st.button("Schedule Bulk Campaign", type="primary", use_container_width=True):
-        import datetime
-        
-        interval_map = {
-            "15 Minutes": datetime.timedelta(minutes=15),
-            "30 Minutes": datetime.timedelta(minutes=30),
-            "1 Hour": datetime.timedelta(hours=1),
-            "2 Hours": datetime.timedelta(hours=2)
-        }
-        interval = interval_map[interval_str]
-        
-        base_time = datetime.datetime.combine(start_date, start_time)
-        
-        # Filter out empty rows
-        valid_df = edited_df[edited_df["content"].str.strip() != ""].copy()
-        
-        if valid_df.empty:
-            st.error("Please enter at least one valid post.")
-        elif not bq_client:
-            st.error("BigQuery client not initialized.")
-        else:
-            with st.spinner("Calculating schedule and pushing to Queue..."):
-                try:
-                    publish_times = []
-                    for idx in range(len(valid_df)):
-                        pub_time = base_time + (interval * idx)
-                        publish_times.append(pub_time)
-                        
-                    valid_df['publish_time'] = publish_times
-                    valid_df['post_id'] = 0
-                    
-                    # Ensure correct column order and type conversion for BQ
-                    final_df = valid_df[['site_id', 'thread_id', 'post_id', 'username', 'content', 'post_type', 'target_link', 'publish_time']]
-                    final_df['publish_time'] = pd.to_datetime(final_df['publish_time'])
-                    final_df['thread_id'] = pd.to_numeric(final_df['thread_id'], errors='coerce').fillna(0).astype('Int64')
-                    final_df['post_id'] = final_df['post_id'].astype('Int64')
-                    
-                    # Push to BQ
-                    table_id = f"{bq_client.project}.forum_crm.scheduled_queue"
-                    job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
-                    
-                    job = bq_client.load_table_from_dataframe(final_df, table_id, job_config=job_config)
-                    job.result() # Wait for job to finish
-                    
-                    st.success(f"Successfully scheduled {len(final_df)} posts starting at {base_time.strftime('%Y-%m-%d %H:%M:%S')}!")
-                except Exception as e:
-                    st.error(f"Error scheduling campaign: {e}")
-
-with tab_user_stats:
-    st.header("👥 User Activity Stats")
-    st.write("View the total number of Threads and Answers authored by each user.")
-    
-    if not sites:
-        st.warning("No sites available in metadata.")
-    else:
-        stats_site = st.selectbox("Select Forum Site", options=sites, key="stats_site_selector")
-        
-        if st.button("Fetch User Stats", type="primary"):
-            with st.spinner(f"Aggregating activity for {stats_site}..."):
-                stats_df = fetch_user_stats(stats_site)
-                
-                if not stats_df.empty:
-                    # Provide a metric summary above the table
-                    total_threads = int(stats_df['Threads_Created'].sum())
-                    total_answers = int(stats_df['Answers_Posted'].sum())
-                    
-                    col1, col2 = st.columns(2)
-                    col1.metric("Total Threads Authored", total_threads)
-                    col2.metric("Total Answers Posted", total_answers)
-                    
-                    st.dataframe(stats_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info(f"No activity found for {stats_site}.")
-
-with tab_daily_reports:
-    st.header("📅 Daily Operations Report")
-    st.write("Fetch all questions and answers published on a specific date.")
-    
-    if not sites:
-        st.warning("No sites available in metadata.")
-    else:
-        report_site = st.selectbox("Select Forum Site", options=sites, key="report_site_selector")
-        report_date = st.date_input("Select Report Date")
-        
-        if st.button("Generate Reports", type="primary"):
-            with st.spinner(f"Fetching records for {report_site} on {report_date}..."):
-                q_df = fetch_daily_questions(report_site, report_date)
-                a_df = fetch_daily_answers(report_site, report_date)
-                
-                st.subheader(f"Questions ({len(q_df)})")
-                if not q_df.empty:
-                    st.dataframe(q_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No questions found for this date.")
-                    
-                st.subheader(f"Answers ({len(a_df)})")
-                if not a_df.empty:
-                    st.dataframe(a_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No answers found for this date.")
